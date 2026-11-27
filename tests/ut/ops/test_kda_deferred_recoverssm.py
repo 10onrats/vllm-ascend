@@ -63,12 +63,15 @@ def _make_layer(
     blocks: int = NUM_BLOCKS,
     records: int | None = None,
     seed: int = 0,
+    decay: bool = False,
 ) -> SimpleNamespace:
     """Build a minimal layer compatible with KDARecoverSSMCommitContext.create.
 
     The context requires ``layer.kv_cache`` to be a 4-tuple of:
         (conv_state, state_checkpoint, correction_cache, key_gate_cache)
     plus A_log, dt_bias, local_num_heads, head_dim, gate_lower_bound.
+    With ``decay`` it becomes a 6-tuple appending the fp32 decay and
+    normalized-key vector records (the A5 pages' extra entries).
 
     ``records`` sizes the correction/key-gate pool independently of the
     checkpoint's block count (upstream vLLM keeps records in a separate
@@ -92,9 +95,13 @@ def _make_layer(
     record_rows_capacity = blocks if records is None else records
     correction = randn(record_rows_capacity, heads, spec_q, value_dim, dtype=torch.float32)
     kg_cache = randn(record_rows_capacity, heads, spec_q, 2 * key_dim)
+    kv_cache = [conv_state, checkpoint, correction, kg_cache]
+    if decay:
+        kv_cache.append(randn(record_rows_capacity, heads, spec_q, key_dim, dtype=torch.float32))
+        kv_cache.append(randn(record_rows_capacity, heads, spec_q, key_dim, dtype=torch.float32))
 
     return SimpleNamespace(
-        kv_cache=(conv_state, checkpoint, correction, kg_cache),
+        kv_cache=tuple(kv_cache),
         A_log=randn(heads) * 0.5,
         dt_bias=randn(heads * value_dim) * 0.5,
         local_num_heads=heads,
@@ -113,12 +120,13 @@ def _make_context(
     max_reqs: int = 8,
     records: int | None = None,
     seed: int = 0,
+    decay: bool = False,
 ) -> tuple[KDARecoverSSMCommitContext, list[SimpleNamespace]]:
     """Build a fresh context + layers. Each call gets independent tensors."""
     layers = [
         _make_layer(
             heads, key_dim, value_dim, spec_q, blocks,
-            records=records, seed=seed + i,
+            records=records, seed=seed + i, decay=decay,
         )
         for i in range(num_layers)
     ]
@@ -276,9 +284,14 @@ def test_flush_folds_pending_into_checkpoint():
 # Test 4: deferred vs immediate numerical equivalence
 # ---------------------------------------------------------------------------
 
-def test_deferred_vs_immediate_equivalence():
+@pytest.mark.parametrize("decay", [False, True])
+def test_deferred_vs_immediate_equivalence(decay: bool):
     """The end-to-end invariant: deferred path (pending accumulate + flush)
     should produce the same checkpoint as immediate path (commit each step).
+
+    ``decay`` toggles the A5-style fp32 decay/normalized-key vector records
+    that the commit kernel consumes instead of recomputing the per-token
+    gate from the raw key/gate record.
 
     Scenario: 2 requests, 3 spec-decode steps.
       - Immediate: call commit() every step with the accepted counts.
@@ -299,7 +312,7 @@ def test_deferred_vs_immediate_equivalence():
     # --- Immediate path ---
     ctx_imm, layers_imm = _make_context(
         num_layers=num_layers, heads=heads, key_dim=key_dim,
-        value_dim=value_dim, spec_q=spec_q, blocks=blocks, seed=100,
+        value_dim=value_dim, spec_q=spec_q, blocks=blocks, seed=100, decay=decay,
     )
     # Run 3 immediate commits (no pending -> commits every step).
     for _ in range(3):
@@ -313,6 +326,7 @@ def test_deferred_vs_immediate_equivalence():
     ctx_def, layers_def = _make_context(
         num_layers=num_layers, heads=heads, key_dim=key_dim,
         value_dim=value_dim, spec_q=spec_q, blocks=blocks, seed=100,  # SAME seed
+        decay=decay,
     )
     pending = torch.zeros(blocks, dtype=torch.int32, device=DEVICE)
     # 3 deferred steps. Each step: flush previous pending, then commit (defer).
@@ -354,11 +368,13 @@ def test_deferred_vs_immediate_equivalence():
 # Test 4b: fused verify (in-kernel replay) matches flush + stock verify
 # ---------------------------------------------------------------------------
 
-def test_fused_verify_matches_flush_then_verify():
+@pytest.mark.parametrize("decay", [False, True])
+def test_fused_verify_matches_flush_then_verify(decay: bool):
     """``compact_conv`` + verify-with-replay must equal ``flush`` + stock verify.
 
     Both paths fold the same pending replay into the checkpoint and then run
     the same verify; the fused path does the fold inside the verify kernel.
+    ``decay`` toggles the fp32 vector records the fold and the commit consume.
     """
     heads, key_dim, value_dim, spec_q = HEADS, KEY_DIM, VALUE_DIM, SPEC_QUERY_LEN
     blocks, batch = NUM_BLOCKS, 2
@@ -382,7 +398,7 @@ def test_fused_verify_matches_flush_then_verify():
     def run(fused: bool):
         ctx, layers = _make_context(
             num_layers=1, heads=heads, key_dim=key_dim, value_dim=value_dim,
-            spec_q=spec_q, blocks=blocks, seed=200,
+            spec_q=spec_q, blocks=blocks, seed=200, decay=decay,
         )
         layer = layers[0]
         if fused:
@@ -396,6 +412,13 @@ def test_fused_verify_matches_flush_then_verify():
         else:
             ctx.flush(state_indices, record_rows, pending)
             replay = (None, None, None, None)
+        vector_records = {}
+        if len(layer.kv_cache) > 4:
+            vector_records = dict(
+                decay_cache=layer.kv_cache[4],
+                normalized_key_cache=layer.kv_cache[5],
+                store_raw_gate=False,
+            )
         out = kda_recoverssm_verify(
             q, k, v, raw_g, raw_beta,
             layer.A_log.reshape(-1),
@@ -412,6 +435,7 @@ def test_fused_verify_matches_flush_then_verify():
             replay_final_state_indices=replay[1],
             replay_boundary_state_indices=replay[2],
             replay_boundary_recovery_lens=replay[3],
+            **vector_records,
         )
         torch.npu.synchronize()
         return (

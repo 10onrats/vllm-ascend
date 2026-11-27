@@ -31,6 +31,7 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_kda, recurrent_kda
 from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
@@ -225,7 +226,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # vLLM main moved KDA RecoverSSM records out of the KV cache and
             # removed the calculator helper, but Ascend still packs the
             # float32 correction and activation key/gate records into the page.
-            return (*dtypes, torch.float32, get_kv_cache_torch_dtype("auto", self.model_config.dtype))
+            dtypes = (*dtypes, torch.float32, get_kv_cache_torch_dtype("auto", self.model_config.dtype))
+            if is_950():
+                # A5 appends the fp32 decay and normalized-key vector records
+                # the commit consumes instead of recomputing the per-token gate.
+                dtypes = (*dtypes, torch.float32, torch.float32)
         return dtypes
 
     def get_state_shape(
@@ -247,11 +252,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # the layout the Ascend commit context allocates from.
             local_num_heads = divide(self.num_heads, self.tp_size)
             spec_query_len = self.num_spec + 1
-            return (
+            shapes = (
                 *shapes,
                 (local_num_heads, spec_query_len, self.head_dim),
                 (local_num_heads, spec_query_len, 2 * self.head_dim),
             )
+            if is_950():
+                shapes = (
+                    *shapes,
+                    (local_num_heads, spec_query_len, self.head_dim),
+                    (local_num_heads, spec_query_len, self.head_dim),
+                )
         return shapes
 
     def __init__(
@@ -710,9 +721,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # groups. Recurrent writeback handles decode padding without a pre-clear.
         if use_spec:
             if self.use_recoverssm:
-                correction_cache, kg_cache = records
+                correction_cache, kg_cache = records[0], records[1]
                 # One paged checkpoint per request; verification only records
                 # compact updates. MRV2 commits after rejection sampling.
+                # A5 pages append the decay and normalized-key records the
+                # fused replay and the commit consume instead of recomputing
+                # the per-token gate.
+                decay_cache = records[2] if len(records) > 2 else None
+                normalized_key_cache = records[3] if len(records) > 3 else None
                 # Deferred RecoverSSM: the previous step's pending replays were
                 # folded (and joined) above; write this step's records to each
                 # request's record slot (not the batch row).
@@ -741,6 +757,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     replay_final_state_indices=replay[1] if replay is not None else None,
                     replay_boundary_state_indices=replay[2] if replay is not None else None,
                     replay_boundary_recovery_lens=replay[3] if replay is not None else None,
+                    decay_cache=decay_cache,
+                    normalized_key_cache=normalized_key_cache,
+                    store_raw_gate=decay_cache is None or normalized_key_cache is None,
                 )
             else:
                 spec_output = recurrent_kda(

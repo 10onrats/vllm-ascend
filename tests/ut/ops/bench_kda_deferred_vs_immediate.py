@@ -155,6 +155,9 @@ class Case:
             self.indices,
             layer.spec_query_len,
             out=layer.verify_out,
+            decay_cache=layer.kv_cache[4],
+            normalized_key_cache=layer.kv_cache[5],
+            store_raw_gate=False,
             **kwargs,
         )
 
@@ -247,6 +250,12 @@ def build_case(shape: tuple, pattern: str, label: str) -> Case:
             dtype,
             (wide_stride, spec_query_len * 2 * key_dim, 2 * key_dim, 1),
         )
+        # A5 vector records the fused replay and the commit consume instead of
+        # recomputing the per-token gate; contiguous fp32, no page stride.
+        decay = torch.empty(
+            (slots, heads, spec_query_len, key_dim), dtype=torch.float32, device=device
+        )
+        normalized_key = torch.empty_like(decay)
         conv = allocate(
             (slots, 3 * heads * key_dim, spec_query_len + 2),
             dtype,
@@ -267,7 +276,7 @@ def build_case(shape: tuple, pattern: str, label: str) -> Case:
         a_log = torch.randn(heads, device=device) * 0.1
         dt_bias = torch.randn(heads * key_dim, device=device) * 0.1
         layer = SimpleNamespace(
-            kv_cache=(stored_conv, state, correction, kg),
+            kv_cache=(stored_conv, state, correction, kg, decay, normalized_key),
             A_log=a_log,
             dt_bias=dt_bias,
             gate_lower_bound=LOWER_BOUND,
