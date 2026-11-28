@@ -254,102 +254,149 @@ def _kda_recoverssm_verify_kernel(
                 # kernel's static expansion; A3 keeps the runtime bound to
                 # bound UB use.
                 if UNROLL_REPLAY:
-                    # Two phases: hoist every record load above the unrolled
-                    # chain, then run the fold on registers alone. Inside the
-                    # per-token branches the loads sit pinned on the dependency
-                    # chain and pay their latency per accepted token. Dead
-                    # offsets clamp to slot 0 (always in-bounds, unpredicated);
-                    # the chain skips them exactly as before.
-                    corr_pre = []
-                    key_pre = []
-                    gate_pre = []
-                    for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
-                        token_offset = tl.maximum(commit_len - reverse_offset - 1, 0)
-                        corr_pre.append(
-                            tl.load(
-                                replay_correction_ptr
-                                + token_offset * stride_correction_pos
-                                + offs_v * stride_correction_dim,
-                                mask=mask_v,
-                                other=0.0 if mask_v is not None else None,
-                            ).to(tl.float32)
+                    if SPEC_QUERY_LEN <= 6:
+                        # Two phases, straight-lined because this Triton has
+                        # no loop-carried aggregates. Every record load
+                        # issues unconditionally first (dead offsets clamp
+                        # to slot 0, always in-bounds), then the fold chain
+                        # runs on the registers alone, skipping dead offsets
+                        # with the same branch as before. Pinned inside the
+                        # per-token branches, the loads sat on the chain and
+                        # paid their latency per accepted token.
+                        c0, k0, g0 = _load_replay_record(
+                            replay_correction_ptr, replay_kg_ptr,
+                            tl.maximum(commit_len - 1, 0), offs_k, offs_v,
+                            mask_k, mask_v, stride_correction_pos,
+                            stride_correction_dim, stride_kg_pos,
+                            stride_kg_dim, K, replay_decay_ptr,
+                            replay_normalized_key_ptr,
                         )
-                        if replay_normalized_key_ptr is not None:
-                            key_pre.append(
-                                tl.load(
-                                    replay_normalized_key_ptr + token_offset * K + offs_k,
-                                    mask=mask_k,
-                                    other=0.0 if mask_k is not None else None,
+                        if SPEC_QUERY_LEN > 1:
+                            c1, k1, g1 = _load_replay_record(
+                                replay_correction_ptr, replay_kg_ptr,
+                                tl.maximum(commit_len - 2, 0), offs_k, offs_v,
+                                mask_k, mask_v, stride_correction_pos,
+                                stride_correction_dim, stride_kg_pos,
+                                stride_kg_dim, K, replay_decay_ptr,
+                                replay_normalized_key_ptr,
+                            )
+                        if SPEC_QUERY_LEN > 2:
+                            c2, k2, g2 = _load_replay_record(
+                                replay_correction_ptr, replay_kg_ptr,
+                                tl.maximum(commit_len - 3, 0), offs_k, offs_v,
+                                mask_k, mask_v, stride_correction_pos,
+                                stride_correction_dim, stride_kg_pos,
+                                stride_kg_dim, K, replay_decay_ptr,
+                                replay_normalized_key_ptr,
+                            )
+                        if SPEC_QUERY_LEN > 3:
+                            c3, k3, g3 = _load_replay_record(
+                                replay_correction_ptr, replay_kg_ptr,
+                                tl.maximum(commit_len - 4, 0), offs_k, offs_v,
+                                mask_k, mask_v, stride_correction_pos,
+                                stride_correction_dim, stride_kg_pos,
+                                stride_kg_dim, K, replay_decay_ptr,
+                                replay_normalized_key_ptr,
+                            )
+                        if SPEC_QUERY_LEN > 4:
+                            c4, k4, g4 = _load_replay_record(
+                                replay_correction_ptr, replay_kg_ptr,
+                                tl.maximum(commit_len - 5, 0), offs_k, offs_v,
+                                mask_k, mask_v, stride_correction_pos,
+                                stride_correction_dim, stride_kg_pos,
+                                stride_kg_dim, K, replay_decay_ptr,
+                                replay_normalized_key_ptr,
+                            )
+                        if SPEC_QUERY_LEN > 5:
+                            c5, k5, g5 = _load_replay_record(
+                                replay_correction_ptr, replay_kg_ptr,
+                                tl.maximum(commit_len - 6, 0), offs_k, offs_v,
+                                mask_k, mask_v, stride_correction_pos,
+                                stride_correction_dim, stride_kg_pos,
+                                stride_kg_dim, K, replay_decay_ptr,
+                                replay_normalized_key_ptr,
+                            )
+                        fd, fc = final_decay, final_correction
+                        bdd, bc = boundary_decay, boundary_correction
+                        if 0 < commit_len:
+                            fd, fc, bdd, bc = _fold_replay_record(
+                                c0, k0, g0, commit_len - 1, boundary_recovery_len,
+                                fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                replay_normalized_key_ptr,
+                            )
+                        if SPEC_QUERY_LEN > 1:
+                            if 1 < commit_len:
+                                fd, fc, bdd, bc = _fold_replay_record(
+                                    c1, k1, g1, commit_len - 2, boundary_recovery_len,
+                                    fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                    K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                    replay_normalized_key_ptr,
                                 )
-                            )
-                            gate_pre.append(
-                                tl.load(
-                                    replay_decay_ptr + token_offset * K + offs_k,
-                                    mask=mask_k,
-                                    other=0.0 if mask_k is not None else None,
+                        if SPEC_QUERY_LEN > 2:
+                            if 2 < commit_len:
+                                fd, fc, bdd, bc = _fold_replay_record(
+                                    c2, k2, g2, commit_len - 3, boundary_recovery_len,
+                                    fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                    K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                    replay_normalized_key_ptr,
                                 )
-                            )
-                        else:
-                            key_pre.append(
-                                tl.load(
-                                    replay_kg_ptr
-                                    + token_offset * stride_kg_pos
-                                    + offs_k * stride_kg_dim,
-                                    mask=mask_k,
-                                    other=0.0 if mask_k is not None else None,
-                                ).to(tl.float32)
-                            )
-                            gate_pre.append(
-                                tl.load(
-                                    replay_kg_ptr
-                                    + token_offset * stride_kg_pos
-                                    + (K + offs_k) * stride_kg_dim,
-                                    mask=mask_k,
-                                    other=0.0 if mask_k is not None else None,
-                                ).to(tl.float32)
-                            )
-                    for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
-                        if reverse_offset < commit_len:
-                            token_offset = commit_len - reverse_offset - 1
-                            if replay_normalized_key_ptr is not None:
-                                normalized_k = key_pre[reverse_offset]
-                                decay = gate_pre[reverse_offset]
-                            else:
-                                normalized_k = _kda_l2_normalize(
-                                    key_pre[reverse_offset], USE_NORM_EPS
+                        if SPEC_QUERY_LEN > 3:
+                            if 3 < commit_len:
+                                fd, fc, bdd, bc = _fold_replay_record(
+                                    c3, k3, g3, commit_len - 4, boundary_recovery_len,
+                                    fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                    K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                    replay_normalized_key_ptr,
                                 )
-                                decay = tl.exp(
-                                    _kda_gate(
-                                        gate_pre[reverse_offset],
-                                        dt_bias,
-                                        A,
-                                        lower_bound,
-                                        USE_LOWER_BOUND,
-                                    )
+                        if SPEC_QUERY_LEN > 4:
+                            if 4 < commit_len:
+                                fd, fc, bdd, bc = _fold_replay_record(
+                                    c4, k4, g4, commit_len - 5, boundary_recovery_len,
+                                    fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                    K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                    replay_normalized_key_ptr,
                                 )
-                            weighted_k = normalized_k * final_decay
-                            final_correction = tl.fma(
-                                corr_pre[reverse_offset][:, None],
-                                weighted_k[None, :],
-                                final_correction,
-                            )
-                            final_decay *= decay
-                            if ALIGN_MODE:
-                                if boundary_recovery_len > 0:
-                                    before_boundary = token_offset < boundary_recovery_len
-                                    boundary_k = normalized_k * boundary_decay
-                                    boundary_correction = tl.where(
-                                        before_boundary,
-                                        tl.fma(
-                                            corr_pre[reverse_offset][:, None],
-                                            boundary_k[None, :],
-                                            boundary_correction,
-                                        ),
-                                        boundary_correction,
-                                    )
-                                    boundary_decay *= tl.where(
-                                        before_boundary, decay, 1.0
-                                    )
+                        if SPEC_QUERY_LEN > 5:
+                            if 5 < commit_len:
+                                fd, fc, bdd, bc = _fold_replay_record(
+                                    c5, k5, g5, commit_len - 6, boundary_recovery_len,
+                                    fd, fc, bdd, bc, A, dt_bias, lower_bound,
+                                    K, USE_LOWER_BOUND, USE_NORM_EPS, ALIGN_MODE,
+                                    replay_normalized_key_ptr,
+                                )
+                        final_decay, final_correction = fd, fc
+                        boundary_decay, boundary_correction = bdd, bc
+                    else:
+                        for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
+                            if reverse_offset < commit_len:
+                                final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
+                                    replay_correction_ptr,
+                                    replay_kg_ptr,
+                                    commit_len - reverse_offset - 1,
+                                    offs_k,
+                                    offs_v,
+                                    mask_k,
+                                    mask_v,
+                                    stride_correction_pos,
+                                    stride_correction_dim,
+                                    stride_kg_pos,
+                                    stride_kg_dim,
+                                    A,
+                                    dt_bias,
+                                    lower_bound,
+                                    boundary_recovery_len,
+                                    final_decay,
+                                    final_correction,
+                                    boundary_decay,
+                                    boundary_correction,
+                                    K,
+                                    USE_LOWER_BOUND,
+                                    USE_NORM_EPS,
+                                    ALIGN_MODE,
+                                    replay_decay_ptr,
+                                    replay_normalized_key_ptr,
+                                )
                 else:
                     for reverse_offset in range(0, tl.minimum(commit_len, SPEC_QUERY_LEN)):
                         final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
@@ -859,6 +906,105 @@ def _accumulate_kda_commit_step(
             boundary_correction = tl.where(
                 before_boundary,
                 tl.fma(correction[:, None], boundary_k[None, :], boundary_correction),
+                boundary_correction,
+            )
+            boundary_decay *= tl.where(before_boundary, decay, 1.0)
+    return final_decay, final_correction, boundary_decay, boundary_correction
+
+
+@triton.jit
+def _load_replay_record(
+    correction_cache_ptr,
+    kg_cache_ptr,
+    token_offset,
+    offs_k,
+    offs_v,
+    mask_k,
+    mask_v,
+    stride_correction_pos,
+    stride_correction_dim,
+    stride_kg_pos,
+    stride_kg_dim,
+    K: tl.constexpr,
+    decay_ptr,
+    normalized_key_ptr,
+):
+    correction = tl.load(
+        correction_cache_ptr
+        + token_offset * stride_correction_pos
+        + offs_v * stride_correction_dim,
+        mask=mask_v,
+        other=0.0 if mask_v is not None else None,
+    ).to(tl.float32)
+    if normalized_key_ptr is not None:
+        key = tl.load(
+            normalized_key_ptr + token_offset * K + offs_k,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
+        )
+        gate = tl.load(
+            decay_ptr + token_offset * K + offs_k,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
+        )
+    else:
+        key = tl.load(
+            kg_cache_ptr
+            + token_offset * stride_kg_pos
+            + offs_k * stride_kg_dim,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
+        ).to(tl.float32)
+        gate = tl.load(
+            kg_cache_ptr
+            + token_offset * stride_kg_pos
+            + (K + offs_k) * stride_kg_dim,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
+        ).to(tl.float32)
+    return correction, key, gate
+
+
+@triton.jit
+def _fold_replay_record(
+    correction,
+    key,
+    gate,
+    token_offset,
+    boundary_recovery_len,
+    final_decay,
+    final_correction,
+    boundary_decay,
+    boundary_correction,
+    A,
+    dt_bias,
+    lower_bound,
+    K: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    USE_NORM_EPS: tl.constexpr,
+    ALIGN_MODE: tl.constexpr,
+    normalized_key_ptr,
+):
+    if normalized_key_ptr is not None:
+        normalized_k = key
+        decay = gate
+    else:
+        normalized_k = _kda_l2_normalize(key, USE_NORM_EPS)
+        decay = tl.exp(_kda_gate(gate, dt_bias, A, lower_bound, USE_LOWER_BOUND))
+    weighted_k = normalized_k * final_decay
+    final_correction = tl.fma(
+        correction[:, None], weighted_k[None, :], final_correction
+    )
+    final_decay *= decay
+    if ALIGN_MODE:
+        if boundary_recovery_len > 0:
+            before_boundary = token_offset < boundary_recovery_len
+            boundary_k = normalized_k * boundary_decay
+            boundary_correction = tl.where(
+                before_boundary,
+                tl.fma(
+                    correction[:, None], boundary_k[None, :], boundary_correction
+                ),
                 boundary_correction,
             )
             boundary_decay *= tl.where(before_boundary, decay, 1.0)
