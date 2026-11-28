@@ -197,7 +197,6 @@ def _kda_recoverssm_verify_kernel(
         + offs_v[:, None] * stride_state_v
         + offs_k[None, :] * stride_state_k
     )
-    state = tl.load(state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None).to(tl.float32)
     a_log = tl.load(A_log_ptr + pid_h).to(tl.float32)
     tl.static_assert(a_log.dtype == tl.float32)
     A = tl.exp(a_log)
@@ -211,9 +210,11 @@ def _kda_recoverssm_verify_kernel(
     ).to(tl.float32)
 
     # Deferred RecoverSSM, fused path: fold the previous step's accepted
-    # tokens into the checkpoint before this verify advances it.  The state is
-    # already in registers, so the replay reuses this load instead of a
-    # separate commit kernel's load + launch.
+    # tokens into the checkpoint before this verify advances it. The
+    # checkpoint loads after the fold, the lean commit kernel's discipline:
+    # the fold phase then holds one [BV, BK] accumulator instead of two, and
+    # the load still rides this launch instead of paying the commit kernel's
+    # separate load + launch.
     if HAS_REPLAY:
         commit_len = tl.load(replay_commit_lens_ptr + pid_b)
         if commit_len > 0:
@@ -221,7 +222,6 @@ def _kda_recoverssm_verify_kernel(
             boundary_state_idx = tl.load(replay_boundary_state_indices_ptr + pid_b).to(tl.int64)
             boundary_recovery_len = tl.load(replay_boundary_recovery_lens_ptr + pid_b)
             if final_state_idx > null_block_id:
-                initial_state = state
                 replay_correction_ptr = (
                     correction_cache_ptr
                     + record_row * stride_correction_block
@@ -426,6 +426,9 @@ def _kda_recoverssm_verify_kernel(
                             replay_decay_ptr,
                             replay_normalized_key_ptr,
                         )
+                initial_state = tl.load(
+                    state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None
+                ).to(tl.float32)
                 state = initial_state * final_decay[None, :] + final_correction
                 final_ptrs = (
                     state_ptr
@@ -448,6 +451,18 @@ def _kda_recoverssm_verify_kernel(
                         )
                         boundary_state = initial_state * boundary_decay[None, :] + boundary_correction
                         tl.store(boundary_ptrs, boundary_state, mask=mask_state)
+            else:
+                state = tl.load(
+                    state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None
+                ).to(tl.float32)
+        else:
+            state = tl.load(
+                state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None
+            ).to(tl.float32)
+    else:
+        state = tl.load(
+            state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None
+        ).to(tl.float32)
 
     for token_offset in range(tl.maximum(query_len - 1, 0)):
         token = bos + token_offset
