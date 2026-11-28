@@ -254,35 +254,102 @@ def _kda_recoverssm_verify_kernel(
                 # kernel's static expansion; A3 keeps the runtime bound to
                 # bound UB use.
                 if UNROLL_REPLAY:
+                    # Two phases: hoist every record load above the unrolled
+                    # chain, then run the fold on registers alone. Inside the
+                    # per-token branches the loads sit pinned on the dependency
+                    # chain and pay their latency per accepted token. Dead
+                    # offsets clamp to slot 0 (always in-bounds, unpredicated);
+                    # the chain skips them exactly as before.
+                    corr_pre = []
+                    key_pre = []
+                    gate_pre = []
+                    for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
+                        token_offset = tl.maximum(commit_len - reverse_offset - 1, 0)
+                        corr_pre.append(
+                            tl.load(
+                                replay_correction_ptr
+                                + token_offset * stride_correction_pos
+                                + offs_v * stride_correction_dim,
+                                mask=mask_v,
+                                other=0.0 if mask_v is not None else None,
+                            ).to(tl.float32)
+                        )
+                        if replay_normalized_key_ptr is not None:
+                            key_pre.append(
+                                tl.load(
+                                    replay_normalized_key_ptr + token_offset * K + offs_k,
+                                    mask=mask_k,
+                                    other=0.0 if mask_k is not None else None,
+                                )
+                            )
+                            gate_pre.append(
+                                tl.load(
+                                    replay_decay_ptr + token_offset * K + offs_k,
+                                    mask=mask_k,
+                                    other=0.0 if mask_k is not None else None,
+                                )
+                            )
+                        else:
+                            key_pre.append(
+                                tl.load(
+                                    replay_kg_ptr
+                                    + token_offset * stride_kg_pos
+                                    + offs_k * stride_kg_dim,
+                                    mask=mask_k,
+                                    other=0.0 if mask_k is not None else None,
+                                ).to(tl.float32)
+                            )
+                            gate_pre.append(
+                                tl.load(
+                                    replay_kg_ptr
+                                    + token_offset * stride_kg_pos
+                                    + (K + offs_k) * stride_kg_dim,
+                                    mask=mask_k,
+                                    other=0.0 if mask_k is not None else None,
+                                ).to(tl.float32)
+                            )
                     for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
                         if reverse_offset < commit_len:
-                            final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
-                                replay_correction_ptr,
-                                replay_kg_ptr,
-                                commit_len - reverse_offset - 1,
-                                offs_k,
-                                offs_v,
-                                mask_k,
-                                mask_v,
-                                stride_correction_pos,
-                                stride_correction_dim,
-                                stride_kg_pos,
-                                stride_kg_dim,
-                                A,
-                                dt_bias,
-                                lower_bound,
-                                boundary_recovery_len,
-                                final_decay,
+                            token_offset = commit_len - reverse_offset - 1
+                            if replay_normalized_key_ptr is not None:
+                                normalized_k = key_pre[reverse_offset]
+                                decay = gate_pre[reverse_offset]
+                            else:
+                                normalized_k = _kda_l2_normalize(
+                                    key_pre[reverse_offset], USE_NORM_EPS
+                                )
+                                decay = tl.exp(
+                                    _kda_gate(
+                                        gate_pre[reverse_offset],
+                                        dt_bias,
+                                        A,
+                                        lower_bound,
+                                        USE_LOWER_BOUND,
+                                    )
+                                )
+                            weighted_k = normalized_k * final_decay
+                            final_correction = tl.fma(
+                                corr_pre[reverse_offset][:, None],
+                                weighted_k[None, :],
                                 final_correction,
-                                boundary_decay,
-                                boundary_correction,
-                                K,
-                                USE_LOWER_BOUND,
-                                USE_NORM_EPS,
-                                ALIGN_MODE,
-                                replay_decay_ptr,
-                                replay_normalized_key_ptr,
                             )
+                            final_decay *= decay
+                            if ALIGN_MODE:
+                                if boundary_recovery_len > 0:
+                                    before_boundary = token_offset < boundary_recovery_len
+                                    boundary_k = normalized_k * boundary_decay
+                                    boundary_correction = tl.where(
+                                        before_boundary,
+                                        tl.fma(
+                                            corr_pre[reverse_offset][:, None],
+                                            boundary_k[None, :],
+                                            boundary_correction,
+                                        ),
+                                        boundary_correction,
+                                    )
+                                    boundary_decay *= tl.where(
+                                        before_boundary, decay, 1.0
+                                    )
                 else:
                     for reverse_offset in range(0, tl.minimum(commit_len, SPEC_QUERY_LEN)):
                         final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
