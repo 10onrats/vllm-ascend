@@ -1399,14 +1399,17 @@ def kda_recoverssm_verify(
     # Grid specialization: large tiles halve redundant K-side loads and win once
     # enough programs keep the NPU busy; below that, smaller tiles keep more
     # programs in flight. Measured crossover: 96 programs (batch*heads*V tiles).
-    # An aligned fused replay keeps the boundary-correction accumulator live
-    # beside the checkpoint and the final accumulator, so it caps the value tile
-    # instead of taking the large one; the plain and non-aligned fused paths stay
-    # at the stock verify's matrix count and keep the large-tile upgrade.
+    # Any fused replay caps the value tile: the aligned one keeps the
+    # boundary-correction accumulator live beside the checkpoint and the final
+    # accumulator, and the unaligned one still folds a per-token outer product
+    # inside the full scan kernel — the lean commit kernel runs the identical
+    # fold at this tile width 33-43% cheaper per token, so halving the fused
+    # fold's footprint is the cheaper side of the trade. The plain path keeps
+    # the stock verify's matrix count and the large-tile upgrade.
     is_a5 = is_950()
     block_v = min(triton.next_power_of_2(value_dim), RECOVERSSM_VALUE_TILE)
     has_replay = replay_commit_lens is not None
-    caps_large_tile = has_replay and replay_align
+    caps_large_tile = has_replay
     if (
         is_a5
         and not caps_large_tile
