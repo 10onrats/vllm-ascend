@@ -784,14 +784,17 @@ def _accumulate_kda_commit_step(
     final_correction = tl.fma(correction[:, None], weighted_k[None, :], final_correction)
     final_decay *= decay
     if ALIGN_MODE:
-        before_boundary = token_offset < boundary_recovery_len
-        boundary_k = normalized_k * boundary_decay
-        boundary_correction = tl.where(
-            before_boundary,
-            tl.fma(correction[:, None], boundary_k[None, :], boundary_correction),
-            boundary_correction,
-        )
-        boundary_decay *= tl.where(before_boundary, decay, 1.0)
+        # Non-crossing rows keep identity accumulators for every token; skip
+        # the dead per-token bookkeeping the same way the store side does.
+        if boundary_recovery_len > 0:
+            before_boundary = token_offset < boundary_recovery_len
+            boundary_k = normalized_k * boundary_decay
+            boundary_correction = tl.where(
+                before_boundary,
+                tl.fma(correction[:, None], boundary_k[None, :], boundary_correction),
+                boundary_correction,
+            )
+            boundary_decay *= tl.where(before_boundary, decay, 1.0)
     return final_decay, final_correction, boundary_decay, boundary_correction
 
 
